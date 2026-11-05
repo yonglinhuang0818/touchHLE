@@ -1,0 +1,218 @@
+diff --git a/src/frameworks/core_foundation.rs b/src/frameworks/core_foundation.rs
+index 5f85b03..acb4ad0 100644
+--- a/src/frameworks/core_foundation.rs
++++ b/src/frameworks/core_foundation.rs
+@@ -7,5 +7,6 @@
+ pub mod cf_number;
+ pub mod cf_preferences;
++pub mod cf_read_stream;
+ pub mod cf_run_loop;
+ pub mod cf_run_loop_timer;
+ pub mod cf_socket;
+@@ -25,5 +26,6 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+     aliases: &[],
+     class_exports: &[
++        cf_read_stream::CLASSES, // Special internal classes.
+         cf_run_loop_timer::CLASSES, // Special internal classes.
+         cf_uuid::CLASSES,
+     ],
+@@ -48,5 +50,6 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         cf_number::FUNCTIONS,
+         cf_preferences::FUNCTIONS,
++        cf_read_stream::FUNCTIONS,
+         cf_run_loop::FUNCTIONS,
+         cf_run_loop_timer::FUNCTIONS,
+         cf_string::FUNCTIONS,
+diff --git a/src/frameworks/core_foundation/cf_read_stream.rs b/src/frameworks/core_foundation/cf_read_stream.rs
+new file mode 100644
+index 0000000..5182d58
+--- /dev/null
++++ b/src/frameworks/core_foundation/cf_read_stream.rs
+@@ -0,0 +1,187 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! File-backed `CFReadStream` support.
++//!
++//! CF streams are toll-free bridged with NS streams on Apple platforms.  Old
++//! iOS games also use the C API directly, so provide the small synchronous,
++//! file-backed subset here on top of touchHLE's virtual POSIX filesystem.
++
++use super::cf_allocator::{kCFAllocatorDefault, CFAllocatorRef};
++use super::{CFIndex, CFTypeRef};
++use crate::dyld::{export_c_func, FunctionExports};
++use crate::frameworks::foundation::ns_string::{from_rust_string, to_rust_string};
++use crate::libc::posix_io;
++use crate::mem::{MutPtr, Ptr};
++use crate::objc::{id, msg, objc_classes, release, ClassExports, HostObject};
++use crate::Environment;
++
++pub type CFReadStreamRef = CFTypeRef;
++type CFStreamStatus = CFIndex;
++
++const K_CF_STREAM_STATUS_NOT_OPEN: CFStreamStatus = 0;
++const K_CF_STREAM_STATUS_OPEN: CFStreamStatus = 2;
++const K_CF_STREAM_STATUS_READING: CFStreamStatus = 3;
++const K_CF_STREAM_STATUS_AT_END: CFStreamStatus = 5;
++const K_CF_STREAM_STATUS_CLOSED: CFStreamStatus = 6;
++const K_CF_STREAM_STATUS_ERROR: CFStreamStatus = 7;
++
++struct CFReadStreamHostObject {
++    path: String,
++    fd: posix_io::FileDescriptor,
++    status: CFStreamStatus,
++}
++impl HostObject for CFReadStreamHostObject {}
++
++fn CFReadStreamCreateWithFile(
++    env: &mut Environment,
++    allocator: CFAllocatorRef,
++    file_url: CFTypeRef,
++) -> CFReadStreamRef {
++    assert!(allocator == kCFAllocatorDefault || env.mem.read(allocator).is_system_default()); // unimplemented
++    if file_url.is_null() {
++        return Ptr::null();
++    }
++
++    let path: id = msg![env; file_url path];
++    if path.is_null() {
++        return Ptr::null();
++    }
++    let path = to_rust_string(env, path);
++    let host_object = Box::new(CFReadStreamHostObject {
++        path,
++        fd: -1,
++        status: K_CF_STREAM_STATUS_NOT_OPEN,
++    });
++    let class = env
++        .objc
++        .get_known_class("_touchHLE_CFReadStream", &mut env.mem);
++    env.objc.alloc_object(class, host_object, &mut env.mem)
++}
++
++fn CFReadStreamOpen(env: &mut Environment, stream: CFReadStreamRef) -> bool {
++    let (path, status) = {
++        let stream = env.objc.borrow::<CFReadStreamHostObject>(stream);
++        (stream.path.clone(), stream.status)
++    };
++    if status == K_CF_STREAM_STATUS_OPEN || status == K_CF_STREAM_STATUS_READING {
++        return true;
++    }
++    if status != K_CF_STREAM_STATUS_NOT_OPEN {
++        return false;
++    }
++
++    let path_string = from_rust_string(env, path);
++    let path_c_string = msg![env; path_string UTF8String];
++    let fd = posix_io::open_direct(env, path_c_string, posix_io::O_RDONLY);
++    release(env, path_string);
++
++    let stream = env.objc.borrow_mut::<CFReadStreamHostObject>(stream);
++    stream.fd = fd;
++    stream.status = if fd == -1 {
++        K_CF_STREAM_STATUS_ERROR
++    } else {
++        K_CF_STREAM_STATUS_OPEN
++    };
++    fd != -1
++}
++
++fn CFReadStreamRead(
++    env: &mut Environment,
++    stream: CFReadStreamRef,
++    buffer: MutPtr<u8>,
++    buffer_length: CFIndex,
++) -> CFIndex {
++    if buffer_length < 0 {
++        return -1;
++    }
++    let fd = {
++        let stream = env.objc.borrow::<CFReadStreamHostObject>(stream);
++        if stream.status != K_CF_STREAM_STATUS_OPEN
++            && stream.status != K_CF_STREAM_STATUS_READING
++        {
++            return -1;
++        }
++        stream.fd
++    };
++
++    let bytes_read = posix_io::read(
++        env,
++        fd,
++        buffer.cast(),
++        buffer_length.try_into().unwrap(),
++    );
++    let stream = env.objc.borrow_mut::<CFReadStreamHostObject>(stream);
++    if bytes_read < 0 {
++        stream.status = K_CF_STREAM_STATUS_ERROR;
++        -1
++    } else if bytes_read == 0 {
++        stream.status = K_CF_STREAM_STATUS_AT_END;
++        0
++    } else {
++        stream.status = K_CF_STREAM_STATUS_READING;
++        bytes_read.try_into().unwrap()
++    }
++}
++
++fn CFReadStreamHasBytesAvailable(env: &mut Environment, stream: CFReadStreamRef) -> bool {
++    let status = env
++        .objc
++        .borrow::<CFReadStreamHostObject>(stream)
++        .status;
++    status == K_CF_STREAM_STATUS_OPEN || status == K_CF_STREAM_STATUS_READING
++}
++
++fn CFReadStreamGetStatus(
++    env: &mut Environment,
++    stream: CFReadStreamRef,
++) -> CFStreamStatus {
++    env.objc
++        .borrow::<CFReadStreamHostObject>(stream)
++        .status
++}
++
++fn CFReadStreamCopyError(_env: &mut Environment, _stream: CFReadStreamRef) -> CFTypeRef {
++    // TODO: construct a CFError containing the virtual filesystem's errno.
++    Ptr::null()
++}
++
++fn CFReadStreamClose(env: &mut Environment, stream: CFReadStreamRef) {
++    let fd = env.objc.borrow::<CFReadStreamHostObject>(stream).fd;
++    if fd != -1 {
++        posix_io::close(env, fd);
++    }
++    let stream = env.objc.borrow_mut::<CFReadStreamHostObject>(stream);
++    stream.fd = -1;
++    stream.status = K_CF_STREAM_STATUS_CLOSED;
++}
++
++pub const FUNCTIONS: FunctionExports = &[
++    export_c_func!(CFReadStreamCreateWithFile(_, _)),
++    export_c_func!(CFReadStreamOpen(_)),
++    export_c_func!(CFReadStreamRead(_, _, _)),
++    export_c_func!(CFReadStreamHasBytesAvailable(_)),
++    export_c_func!(CFReadStreamGetStatus(_)),
++    export_c_func!(CFReadStreamCopyError(_)),
++    export_c_func!(CFReadStreamClose(_)),
++];
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation _touchHLE_CFReadStream: NSObject
++
++- (())dealloc {
++    let fd = env.objc.borrow::<CFReadStreamHostObject>(this).fd;
++    if fd != -1 {
++        posix_io::close(env, fd);
++    }
++    env.objc.dealloc_object(this, &mut env.mem)
++}
++
++@end
++
++};
