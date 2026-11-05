@@ -80,7 +80,7 @@ index 0000000..5182d58
 +    if path.is_null() {
 +        return Ptr::null();
 +    }
-+    let path = to_rust_string(env, path);
++    let path = to_rust_string(env, path).into_owned();
 +    let host_object = Box::new(CFReadStreamHostObject {
 +        path,
 +        fd: -1,
