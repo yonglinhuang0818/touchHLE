@@ -1,0 +1,231 @@
+diff --git a/src/frameworks/core_foundation/cf_string.rs b/src/frameworks/core_foundation/cf_string.rs
+index d763aea..63f8867 100644
+--- a/src/frameworks/core_foundation/cf_string.rs
++++ b/src/frameworks/core_foundation/cf_string.rs
+@@ -32,6 +32,7 @@ pub const kCFStringEncodingUTF16: CFStringEncoding = kCFStringEncodingUnicode;
+ pub const kCFStringEncodingUTF16BE: CFStringEncoding = 0x10000100;
+ pub const kCFStringEncodingUTF16LE: CFStringEncoding = 0x14000100;
+ pub const kCFStringEncodingISOLatin1: CFStringEncoding = 0x0201;
++pub const kCFStringEncodingDOSKorean: CFStringEncoding = 0x0422;
+ 
+ fn CFStringAppend(
+     env: &mut Environment,
+@@ -78,6 +79,7 @@ pub fn CFStringConvertEncodingToNSStringEncoding(
+         kCFStringEncodingUTF16BE => ns_string::NSUTF16BigEndianStringEncoding,
+         kCFStringEncodingUTF16LE => ns_string::NSUTF16LittleEndianStringEncoding,
+         kCFStringEncodingISOLatin1 => ns_string::NSISOLatin1StringEncoding,
++        kCFStringEncodingDOSKorean => ns_string::NSDOSKoreanStringEncoding,
+         _ => unimplemented!("Unhandled: CFStringEncoding {:#x}", encoding),
+     }
+ }
+@@ -93,6 +95,7 @@ fn CFStringConvertNSStringEncodingToEncoding(
+         ns_string::NSUTF16BigEndianStringEncoding => kCFStringEncodingUTF16BE,
+         ns_string::NSUTF16LittleEndianStringEncoding => kCFStringEncodingUTF16LE,
+         ns_string::NSISOLatin1StringEncoding => kCFStringEncodingISOLatin1,
++        ns_string::NSDOSKoreanStringEncoding => kCFStringEncodingDOSKorean,
+         _ => unimplemented!("Unhandled: NSStringEncoding {:#x}", encoding),
+     }
+ }
+diff --git a/src/frameworks/foundation/ns_string.rs b/src/frameworks/foundation/ns_string.rs
+index 99906b0..658fe2b 100644
+--- a/src/frameworks/foundation/ns_string.rs
++++ b/src/frameworks/foundation/ns_string.rs
+@@ -30,7 +30,7 @@ use crate::objc::{
+     HostObject, NSZonePtr, ObjC,
+ };
+ use crate::{fs, Environment};
+-use encoding_rs::{SHIFT_JIS, WINDOWS_1252};
++use encoding_rs::{EUC_KR, SHIFT_JIS, WINDOWS_1252};
+ use std::borrow::Cow;
+ use std::collections::HashMap;
+ use std::io::Write;
+@@ -46,6 +46,7 @@ pub const NSUnicodeStringEncoding: NSUInteger = 10;
+ pub const NSWindowsCP1252StringEncoding: NSUInteger = 12;
+ pub const NSMacOSRomanStringEncoding: NSUInteger = 30;
+ pub const NSUTF16StringEncoding: NSUInteger = NSUnicodeStringEncoding;
++pub const NSDOSKoreanStringEncoding: NSUInteger = 0x80000422;
+ pub const NSUTF16BigEndianStringEncoding: NSUInteger = 0x90000100;
+ pub const NSUTF16LittleEndianStringEncoding: NSUInteger = 0x94000100;
+ 
+@@ -62,6 +63,7 @@ const C_STRING_FRIENDLY_ENCODINGS: &[NSStringEncoding] = &[
+     NSWindowsCP1252StringEncoding,
+     NSMacOSRomanStringEncoding,
+     NSISOLatin1StringEncoding,
++    NSDOSKoreanStringEncoding,
+ ];
+ 
+ pub const NSMaximumStringLength: NSUInteger = (i32::MAX - 1) as _;
+@@ -135,6 +137,14 @@ impl StringHostObject {
+                 log_dbg!("ShiftJIS decoded {:?}", cow);
+                 StringHostObject::Utf8(Cow::Owned(cow.to_string()))
+             }
++            NSDOSKoreanStringEncoding => {
++                // encoding_rs calls its Windows-949/UHC implementation EUC_KR,
++                // following the WHATWG Encoding Standard's canonical name.
++                let (cow, encoding_used, had_errors) = EUC_KR.decode(&bytes);
++                assert_eq!(encoding_used, EUC_KR);
++                assert!(!had_errors);
++                StringHostObject::Utf8(Cow::Owned(cow.into_owned()))
++            }
+             NSUTF16StringEncoding
+             | NSUTF16BigEndianStringEncoding
+             | NSUTF16LittleEndianStringEncoding => {
+@@ -202,6 +212,17 @@ impl StringHostObject {
+     }
+ }
+ 
++fn encode_dos_korean(string: &str) -> Option<Cow<'_, [u8]>> {
++    // encoding_rs::EUC_KR is Windows-949/UHC, not strict KS X 1001 EUC-KR.
++    let (bytes, encoding_used, had_errors) = EUC_KR.encode(string);
++    assert_eq!(encoding_used, EUC_KR);
++    if had_errors {
++        None
++    } else {
++        Some(bytes)
++    }
++}
++
+ enum CodeUnitIterator<'a> {
+     Utf8(std::str::EncodeUtf16<'a>),
+     Utf16(std::slice::Iter<'a, u16>),
+@@ -488,7 +509,13 @@ pub const CLASSES: ClassExports = objc_classes! {
+ }
+ 
+ - (NSUInteger)lengthOfBytesUsingEncoding:(NSStringEncoding)encoding {
+-    if C_STRING_FRIENDLY_ENCODINGS.contains(&encoding) {
++    if encoding == NSDOSKoreanStringEncoding {
++        encode_dos_korean(&to_rust_string(env, this))
++            .expect("string cannot be represented as DOS Korean / Windows-949")
++            .len()
++            .try_into()
++            .unwrap()
++    } else if C_STRING_FRIENDLY_ENCODINGS.contains(&encoding) {
+         let string = to_rust_string(env, this);
+         assert!(string.as_bytes().iter().all(|byte| byte.is_ascii())); // TODO
+         string.len().try_into().unwrap()
+@@ -828,10 +855,14 @@ pub const CLASSES: ClassExports = objc_classes! {
+             string.as_bytes().to_vec()
+         },
+         NSUTF16LittleEndianStringEncoding => string.encode_utf16().flat_map(u16::to_le_bytes).collect(),
++        NSDOSKoreanStringEncoding => encode_dos_korean(&string)
++            .expect("string cannot be represented as DOS Korean / Windows-949")
++            .into_owned(),
+         _ => unimplemented!("{}", encoding),
+     };
+     let null_size: GuestUSize = match encoding {
+-        NSUTF8StringEncoding | NSASCIIStringEncoding | NSMacOSRomanStringEncoding | NSISOLatin1StringEncoding => 1,
++        NSUTF8StringEncoding | NSASCIIStringEncoding | NSMacOSRomanStringEncoding
++            | NSISOLatin1StringEncoding | NSDOSKoreanStringEncoding => 1,
+         NSUTF16LittleEndianStringEncoding => 2,
+         _ => unimplemented!()
+     };
+@@ -1685,13 +1716,21 @@ fn data_using_encoding_lossy_inner(
+             to_rust_string(env, this)
+         );
+     }
++    let string = to_rust_string(env, this);
++    if encoding == NSDOSKoreanStringEncoding {
++        let Some(bytes) = encode_dos_korean(&string) else {
++            return nil;
++        };
++        let c_string = env.mem.alloc_and_write_cstr(&bytes);
++        let length: NSUInteger = (bytes.len() + 1).try_into().unwrap();
++        return msg_class![env; NSData dataWithBytesNoCopy:(c_string.cast_void()) length:length];
++    }
+     assert!(
+         encoding == NSUTF8StringEncoding
+             || encoding == NSASCIIStringEncoding
+             || encoding == NSISOLatin1StringEncoding
+     );
+ 
+-    let string = to_rust_string(env, this);
+     if encoding == NSASCIIStringEncoding || encoding == NSISOLatin1StringEncoding {
+         assert!(string.as_bytes().iter().all(|byte| byte.is_ascii()));
+     }
+@@ -2013,6 +2052,34 @@ mod ns_string_tests {
+         assert!(line_range_helper(&str5, range(6, 1), true, true) == (5, 7, 6));
+         assert!(line_range_helper(&str5, range(4, 1), true, true) == (0, 5, 4));
+     }
++
++    #[test]
++    fn dos_korean_cp949_decode() {
++        // Includes 0x8C63 (U+B620), which is in the UHC extension and not in
++        // strict KS X 1001. This guards against accidentally using strict EUC-KR.
++        let bytes = [
++            0xC7, 0xD1, // U+D55C (한)
++            0xB1, 0xDB, // U+AE00 (글)
++            0x41, 0x42, 0x43,
++            0x8C, 0x63, // U+B620 (똠), UHC extension
++            0xC6, 0x52, // U+D7A3 (힣)
++        ];
++        let decoded =
++            StringHostObject::decode(Cow::Borrowed(&bytes), NSDOSKoreanStringEncoding);
++        assert_eq!(decoded.to_utf8().unwrap(), "한글ABC똠힣");
++    }
++
++    #[test]
++    fn dos_korean_cp949_round_trip() {
++        let string = "한글ABC똠힣";
++        let encoded = encode_dos_korean(string).unwrap();
++        assert_eq!(
++            encoded.as_ref(),
++            &[0xC7, 0xD1, 0xB1, 0xDB, 0x41, 0x42, 0x43, 0x8C, 0x63, 0xC6, 0x52]
++        );
++        let decoded = StringHostObject::decode(encoded, NSDOSKoreanStringEncoding);
++        assert_eq!(decoded.to_utf8().unwrap(), string);
++    }
+ }
+ 
+ /// Helper function to get bytes of a string in the specified NSStringEncoding.
+@@ -2039,31 +2106,39 @@ pub fn get_bytes_buffer_inner(
+             || encoding == NSASCIIStringEncoding
+             || encoding == NSMacOSRomanStringEncoding
+             || encoding == NSISOLatin1StringEncoding
++            || encoding == NSDOSKoreanStringEncoding
+     );
+ 
+     let src = to_rust_string(env, str);
+-    if encoding == NSASCIIStringEncoding
+-        || encoding == NSMacOSRomanStringEncoding
+-        || encoding == NSISOLatin1StringEncoding
+-    {
+-        // TODO: properly support Mac OS Roman and ISO Latin 1 encoding.
+-        // The first 128 characters are identical to the ASCII
+-        assert!(src.as_bytes().iter().all(|byte| byte.is_ascii()));
+-    }
++    let encoded = if encoding == NSDOSKoreanStringEncoding {
++        encode_dos_korean(&src)
++            .expect("string cannot be represented as DOS Korean / Windows-949")
++            .into_owned()
++    } else {
++        if encoding == NSASCIIStringEncoding
++            || encoding == NSMacOSRomanStringEncoding
++            || encoding == NSISOLatin1StringEncoding
++        {
++            // TODO: properly support Mac OS Roman and ISO Latin 1 encoding.
++            // The first 128 characters are identical to the ASCII
++            assert!(src.as_bytes().iter().all(|byte| byte.is_ascii()));
++        }
++        src.as_bytes().to_vec()
++    };
+     let dest = env.mem.bytes_at_mut(buffer, buffer_size);
+     let src_len = if include_null_terminator {
+-        src.len() + 1
++        encoded.len() + 1
+     } else {
+-        src.len()
++        encoded.len()
+     };
+     if dest.len() < src_len {
+         return false;
+     }
+ 
+     let iter: Box<dyn Iterator<Item = &u8>> = if include_null_terminator {
+-        Box::new(src.as_bytes().iter().chain(b"\0".iter()))
++        Box::new(encoded.iter().chain(b"\0".iter()))
+     } else {
+-        Box::new(src.as_bytes().iter())
++        Box::new(encoded.iter())
+     };
+     for (i, &byte) in iter.enumerate() {
+         dest[i] = byte;
