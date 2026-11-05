@@ -1,0 +1,76 @@
+name: Build Hybrid 2 CP949 touchHLE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - touchhle-cp949.patch
+      - .github/workflows/build-hybrid2-android.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Apply Hybrid 2 CP949 patch
+        run: |
+          git apply --check touchhle-cp949.patch
+          git apply touchhle-cp949.patch
+
+      - name: Install Rust Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk@3.5.4 --locked
+
+      - name: Install Boost 1.81
+        run: |
+          curl -L -o boost_1_81_0.7z https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z
+          7z x boost_1_81_0.7z -ovendor
+          mv vendor/boost_1_81_0 vendor/boost
+
+      - name: Install CMake 3.31.6
+        run: |
+          curl -L -O https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz
+          tar xzf cmake-3.31.6-linux-x86_64.tar.gz -C vendor
+          mv vendor/cmake-3.31.6-linux-x86_64 vendor/cmake
+
+      - name: Install Android SDK components
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-31" \
+            "build-tools;31.0.0" \
+            "ndk;25.2.9519653"
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > android/local.properties
+
+      - name: Set up Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Build Android ARM64 APK
+        working-directory: android
+        env:
+          ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/25.2.9519653
+          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/25.2.9519653
+          ANDROID_NDK: /usr/local/lib/android/sdk/ndk/25.2.9519653
+          CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake
+        run: gradle assembleRelease
+
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: touchHLE-Hybrid2-CP949-Android-ARM64
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
