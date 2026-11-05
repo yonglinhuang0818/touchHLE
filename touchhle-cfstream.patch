@@ -71,7 +71,13 @@ index 0000000..5182d58
 +    allocator: CFAllocatorRef,
 +    file_url: CFTypeRef,
 +) -> CFReadStreamRef {
-+    assert!(allocator == kCFAllocatorDefault || env.mem.read(allocator).is_system_default()); // unimplemented
++    // Core Foundation accepts NULL here as another spelling of the default
++    // allocator. Do not try to dereference it as a CFAllocator object.
++    assert!(
++        allocator.is_null()
++            || allocator == kCFAllocatorDefault
++            || env.mem.read(allocator).is_system_default()
++    ); // custom allocators are unimplemented
 +    if file_url.is_null() {
 +        return Ptr::null();
 +    }
