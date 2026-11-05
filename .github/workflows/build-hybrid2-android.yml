@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - touchhle-cp949.patch
+      - touchhle-cfstream.patch
       - .github/workflows/build-hybrid2-android.yml
 
 permissions:
@@ -25,6 +26,11 @@ jobs:
         run: |
           git apply --check touchhle-cp949.patch
           git apply touchhle-cp949.patch
+
+      - name: Apply Hybrid 2 file stream patch
+        run: |
+          git apply --check touchhle-cfstream.patch
+          git apply touchhle-cfstream.patch
 
       - name: Install Rust Android target
         uses: dtolnay/rust-toolchain@stable
@@ -71,6 +77,6 @@ jobs:
       - name: Upload patched APK
         uses: actions/upload-artifact@v4
         with:
-          name: touchHLE-Hybrid2-CP949-Android-ARM64
+          name: touchHLE-Hybrid2-CP949-CFStream-Android-ARM64
           path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
